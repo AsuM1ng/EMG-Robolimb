@@ -101,11 +101,26 @@ class EmgReader:
         except socket.timeout:
             return ""
 
+    def _drain_comm_buffer(self) -> None:
+        assert self.comm_sock is not None
+        self.comm_sock.settimeout(0.05)
+        try:
+            while True:
+                chunk = self.comm_sock.recv(4096)
+                if not chunk:
+                    break
+        except socket.timeout:
+            pass
+
     def connect(self) -> None:
         self.comm_sock = socket.create_connection((self.host, 50040), timeout=2)
         self.emg_sock = socket.create_connection((self.host, 50041), timeout=2)
-        self._send_cmd(f"RATE {self.sample_rate}")
-        self._send_cmd("START")
+        self.emg_sock.settimeout(None)
+        time.sleep(0.2)
+        self._drain_comm_buffer()
+        self._send_cmd(f"RATE {self.sample_rate}", wait_s=0.3)
+        self._send_cmd("RATE?", wait_s=0.3)
+        self._send_cmd("START", wait_s=0.2)
 
     def read_frame(self) -> np.ndarray:
         """读取一帧 EMG（16 通道 float32，单位 V）。"""
