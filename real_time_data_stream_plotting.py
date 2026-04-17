@@ -11,6 +11,7 @@ import argparse
 import socket
 import threading
 import time
+from typing import Optional
 from collections import deque
 from typing import List
 
@@ -124,7 +125,14 @@ class TrignoEMGStreamer:
 
 
 
-def run_plot(host: str, sample_rate: int, num_sensors: int) -> None:
+def run_plot(
+    host: str,
+    sample_rate: int,
+    num_sensors: int,
+    ylim_uv: float = 200.0,
+    check_channel: int = 1,
+    verbose_interval: float = 1.0,
+) -> None:
     streamer = TrignoEMGStreamer(host=host, sample_rate=sample_rate, num_sensors=num_sensors)
     streamer.connect()
 
@@ -136,11 +144,13 @@ def run_plot(host: str, sample_rate: int, num_sensors: int) -> None:
 
     x = np.arange(sample_rate)
     lines = []
+    y_limit_v = abs(ylim_uv) * 1e-6
     for ch in range(num_channels):
         ax = axes[ch]
         (line,) = ax.plot(x, np.zeros_like(x), lw=1)
         ax.set_title(f"EMG {ch + 1}")
-        ax.set_ylim(-0.005, 0.005)
+        # 注意：EMG 常见量级是几十到几百 uV（1e-6 V），过大的 Y 轴会看起来像直线。
+        ax.set_ylim(-y_limit_v, y_limit_v)
         ax.grid(True, alpha=0.3)
         lines.append(line)
 
@@ -148,14 +158,36 @@ def run_plot(host: str, sample_rate: int, num_sensors: int) -> None:
     for ax in axes[num_channels:]:
         ax.set_visible(False)
 
+    check_idx = max(1, min(check_channel, num_channels)) - 1
+    status_text = fig.text(0.01, 0.99, "", ha="left", va="top", fontsize=10)
+
     fig.suptitle("Trigno Real-time EMG")
     plt.tight_layout()
 
+    last_log_t: Optional[float] = None
+
     # 在部分 IDE/后端中，while+pause 可能只刷新一帧；改为 FuncAnimation 持续调度更新。
     def _update(_frame_idx: int):
+        nonlocal last_log_t
+
         win = streamer.get_window()
         for ch in range(num_channels):
             lines[ch].set_ydata(win[ch])
+
+        # 实时健康度指标：RMS 与峰峰值（单位 uV）
+        sig_v = win[check_idx]
+        rms_uv = float(np.sqrt(np.mean(sig_v**2)) * 1e6)
+        pp_uv = float((np.max(sig_v) - np.min(sig_v)) * 1e6)
+        status_text.set_text(
+            f"CH{check_idx+1} RMS={rms_uv:.2f}uV | PP={pp_uv:.2f}uV | "
+            f"如果两者长期接近0，通常表示未收到有效EMG"
+        )
+
+        now = time.time()
+        if last_log_t is None or (now - last_log_t) >= verbose_interval:
+            print(f"[EMG-STATUS] ch{check_idx+1}: RMS={rms_uv:.2f}uV, PP={pp_uv:.2f}uV")
+            last_log_t = now
+
         return lines
 
     ani = FuncAnimation(
@@ -180,6 +212,16 @@ if __name__ == "__main__":
     parser.add_argument("--host", default="192.168.0.58", help="运行 Trigno Utility 的主机 IP")
     parser.add_argument("--rate", type=int, default=2000, help="EMG 采样率")
     parser.add_argument("--sensors", type=int, default=8, help="传感器数量")
+    parser.add_argument("--ylim-uv", type=float, default=200.0, help="绘图Y轴范围(±uV)")
+    parser.add_argument("--check-channel", type=int, default=1, help="用于状态检测的通道(1-based)")
+    parser.add_argument("--verbose-interval", type=float, default=1.0, help="状态打印周期(秒)")
     args = parser.parse_args()
 
-    run_plot(host=args.host, sample_rate=args.rate, num_sensors=args.sensors)
+    run_plot(
+        host=args.host,
+        sample_rate=args.rate,
+        num_sensors=args.sensors,
+        ylim_uv=args.ylim_uv,
+        check_channel=args.check_channel,
+        verbose_interval=args.verbose_interval,
+    )
