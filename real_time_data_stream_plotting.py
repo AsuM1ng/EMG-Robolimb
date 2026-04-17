@@ -78,7 +78,8 @@ def run_plot(
     comm = socket.create_connection((host, 50040), timeout=2.0)
     emg = socket.create_connection((host, 50041), timeout=2.0)
     comm.settimeout(None)
-    emg.settimeout(None)  # 持续流，禁用超时更稳
+    # 使用短超时，避免在无数据时阻塞GUI刷新（Windows下尤为重要）
+    emg.settimeout(0.05)
 
     # 对齐 MATLAB 命令时序
     time.sleep(0.2)
@@ -125,23 +126,33 @@ def run_plot(
     plt.ion()
     plt.show(block=False)
 
-    # 一次读多个样本，减小 Python 调用开销
+    # 非阻塞式累计缓冲：即使短时无数据，也能保持窗口刷新，不会“卡死不画图”。
     frame_bytes = num_channels * 4
-    read_bytes = frame_bytes * chunk_samples
+    pending = bytearray()
 
     try:
         while plt.fignum_exists(fig.number):
-            raw = recv_exact(emg, read_bytes)
-            vals = np.frombuffer(raw, dtype="<f4")
-            if vals.size % num_channels != 0:
-                continue
-            vals = vals.reshape(-1, num_channels)  # [chunk_samples, num_channels]
+            # 1) 尝试收取网络数据（无数据时超时返回，继续刷新界面）
+            try:
+                chunk = emg.recv(4096)
+                if chunk:
+                    pending.extend(chunk)
+            except socket.timeout:
+                pass
 
-            for row in vals:
+            # 2) 解析尽可能多的完整帧（每轮最多处理 chunk_samples 帧，控制CPU占用）
+            frames_parsed = 0
+            while len(pending) >= frame_bytes and frames_parsed < chunk_samples:
+                raw = bytes(pending[:frame_bytes])
+                del pending[:frame_bytes]
+                row = np.frombuffer(raw, dtype="<f4")
+                if row.size != num_channels:
+                    continue
                 for ch in range(num_channels):
                     buffers[ch].append(float(row[ch]))
+                frames_parsed += 1
 
-            # 更新曲线
+            # 3) 更新曲线
             for ch in range(num_channels):
                 arr = np.asarray(buffers[ch], dtype=np.float32)
                 y = np.zeros(window_samples, dtype=np.float32)
@@ -149,7 +160,7 @@ def run_plot(
                     y[-arr.size :] = arr
                 lines[ch].set_ydata(y)
 
-            # 状态：通道1 RMS/峰峰值（uV）
+            # 4) 状态：通道1 RMS/峰峰值（uV）
             ch0 = np.asarray(buffers[0], dtype=np.float32)
             if ch0.size:
                 rms_uv = float(np.sqrt(np.mean(ch0**2)) * 1e6)
@@ -157,7 +168,9 @@ def run_plot(
             else:
                 rms_uv = 0.0
                 pp_uv = 0.0
-            status.set_text(f"CH1 RMS={rms_uv:.2f}uV | PP={pp_uv:.2f}uV")
+            status.set_text(
+                f"CH1 RMS={rms_uv:.2f}uV | PP={pp_uv:.2f}uV | pending={len(pending)} bytes"
+            )
 
             fig.canvas.draw_idle()
             plt.pause(0.01)
