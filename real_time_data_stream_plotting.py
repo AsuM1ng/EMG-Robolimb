@@ -20,15 +20,25 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-def send_cmd(sock: socket.socket, cmd: str, wait_s: float = 0.2) -> str:
-    """向 Trigno 命令端口发送命令并读取简短响应。"""
+def send_cmd(sock: socket.socket, cmd: str, wait_s: float = 0.2, resp_timeout: float = 0.5) -> str:
+    """向 Trigno 命令端口发送命令并读取响应。"""
     sock.sendall((cmd + "\r\n\r").encode("ascii"))
     time.sleep(wait_s)
+
+    end_t = time.time() + resp_timeout
     sock.settimeout(0.1)
-    try:
-        return sock.recv(4096).decode(errors="ignore").strip()
-    except socket.timeout:
-        return ""
+    chunks = []
+    while time.time() < end_t:
+        try:
+            data = sock.recv(4096)
+            if data:
+                chunks.append(data)
+                # 有响应后再给一个短窗口收尾包
+                time.sleep(0.03)
+        except socket.timeout:
+            if chunks:
+                break
+    return b"".join(chunks).decode(errors="ignore").strip()
 
 
 def drain_comm(sock: socket.socket) -> None:
@@ -67,16 +77,24 @@ def run_plot(
 
     comm = socket.create_connection((host, 50040), timeout=2.0)
     emg = socket.create_connection((host, 50041), timeout=2.0)
+    comm.settimeout(None)
     emg.settimeout(None)  # 持续流，禁用超时更稳
 
     # 对齐 MATLAB 命令时序
     time.sleep(0.2)
     drain_comm(comm)
-    send_cmd(comm, f"RATE {rate}", wait_s=0.3)
-    rate_resp = send_cmd(comm, "RATE?", wait_s=0.3)
-    send_cmd(comm, "START", wait_s=0.2)
+    send_cmd(comm, f"RATE {rate}", wait_s=0.3, resp_timeout=0.8)
+    rate_resp = ""
+    for _ in range(3):
+        rate_resp = send_cmd(comm, "RATE?", wait_s=0.25, resp_timeout=0.8)
+        if rate_resp:
+            break
+    send_cmd(comm, "START", wait_s=0.2, resp_timeout=0.3)
 
-    print(f"[INFO] connected to {host}, RATE? -> {rate_resp or 'N/A'}")
+    if not rate_resp:
+        print("[WARN] RATE? -> N/A （未在超时时间内收到命令口响应，但仍继续尝试接收EMG数据）")
+    else:
+        print(f"[INFO] connected to {host}, RATE? -> {rate_resp}")
 
     # 每通道 1 秒环形缓冲
     buffers: List[deque[float]] = [deque(maxlen=window_samples) for _ in range(num_channels)]
@@ -115,6 +133,8 @@ def run_plot(
         while plt.fignum_exists(fig.number):
             raw = recv_exact(emg, read_bytes)
             vals = np.frombuffer(raw, dtype="<f4")
+            if vals.size % num_channels != 0:
+                continue
             vals = vals.reshape(-1, num_channels)  # [chunk_samples, num_channels]
 
             for row in vals:
