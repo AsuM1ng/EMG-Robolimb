@@ -98,7 +98,10 @@ class TrignoEMGStreamer:
             out = np.zeros((self.num_channels, self.sample_rate), dtype=np.float32)
             for i, dq in enumerate(self._buffers):
                 arr = np.asarray(dq, dtype=np.float32)
-                out[i, -len(arr) :] = arr
+                # len(arr)==0 时，"-0" 会被解释为 0，直接赋值会触发广播错误。
+                if arr.size == 0:
+                    continue
+                out[i, -arr.size :] = arr
             return out
 
     def close(self) -> None:
