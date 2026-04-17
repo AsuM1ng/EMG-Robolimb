@@ -15,6 +15,7 @@ from collections import deque
 from typing import List
 
 import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
 import numpy as np
 
 
@@ -128,8 +129,10 @@ def run_plot(host: str, sample_rate: int, num_sensors: int) -> None:
     streamer.connect()
 
     num_channels = num_sensors * 2
-    fig, axes = plt.subplots(4, 4, figsize=(12, 8), sharex=True)
-    axes = axes.flatten()
+    cols = 4
+    rows = int(np.ceil(num_channels / cols))
+    fig, axes = plt.subplots(rows, cols, figsize=(12, 2.2 * rows), sharex=True)
+    axes = np.atleast_1d(axes).flatten()
 
     x = np.arange(sample_rate)
     lines = []
@@ -141,17 +144,34 @@ def run_plot(host: str, sample_rate: int, num_sensors: int) -> None:
         ax.grid(True, alpha=0.3)
         lines.append(line)
 
+    # 隐藏未使用的子图
+    for ax in axes[num_channels:]:
+        ax.set_visible(False)
+
     fig.suptitle("Trigno Real-time EMG")
     plt.tight_layout()
 
+    # 在部分 IDE/后端中，while+pause 可能只刷新一帧；改为 FuncAnimation 持续调度更新。
+    def _update(_frame_idx: int):
+        win = streamer.get_window()
+        for ch in range(num_channels):
+            lines[ch].set_ydata(win[ch])
+        return lines
+
+    ani = FuncAnimation(
+        fig,
+        _update,
+        interval=50,
+        blit=False,
+        cache_frame_data=False,
+    )
+
+    plt.ion()
     try:
-        while plt.fignum_exists(fig.number):
-            win = streamer.get_window()
-            for ch in range(num_channels):
-                lines[ch].set_ydata(win[ch])
-            fig.canvas.draw_idle()
-            plt.pause(0.05)
+        plt.show(block=True)
     finally:
+        # 防止动画对象被提前回收，并确保连接被正确关闭。
+        _ = ani
         streamer.close()
 
 

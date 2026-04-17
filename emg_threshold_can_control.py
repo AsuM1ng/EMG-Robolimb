@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import socket
+import sys
 import time
 from dataclasses import dataclass
 from typing import Iterable, List
@@ -28,6 +29,38 @@ class SDOFrame:
 
 def can_id_for_node(node_id: int) -> int:
     return 0x600 + node_id
+
+
+def _default_can_interface() -> str:
+    """根据平台选择默认 CAN 接口类型。"""
+    # socketcan 仅适用于 Linux（原生 CAN 套接字）。
+    if sys.platform.startswith("linux"):
+        return "socketcan"
+    # Windows + CANtact 常用 slcan（串口）模式。
+    if sys.platform.startswith("win"):
+        return "slcan"
+    # 其他平台先给虚拟接口用于联调。
+    return "virtual"
+
+
+def _default_can_channel(interface_name: str) -> str:
+    if interface_name == "slcan" and sys.platform.startswith("win"):
+        # Windows 下给 CANtact/串口 CAN 一个常见默认值，可通过 --can-if 覆盖。
+        return "COM3"
+    return "can0"
+
+
+def _can_setup_hint(interface_name: str) -> str:
+    if interface_name == "socketcan":
+        return (
+            "当前接口为 socketcan，仅支持 Linux PF_CAN。"
+            "如果你在 Windows 上，请改用 --can-type pcan / vector / ixxat / kvaser / slcan "
+            "（取决于你的 CAN 适配器驱动）。CANtact/Canable 常见可用 --can-type slcan --can-if COMx。"
+        )
+    return (
+        "请确认 CAN 适配器驱动与 python-can 接口类型匹配，"
+        "例如 Windows 常见为 pcan/vector/ixxat/kvaser。"
+    )
 
 
 # 参考 robolimb_boardmain_large/USER/sdo_frames.c
@@ -102,9 +135,19 @@ class EmgReader:
 class MotorController:
     """封装 CAN SDO 发送。"""
 
-    def __init__(self, channel: str, bustype: str, bitrate: int, node_id: int = 3):
+    def __init__(self, channel: str, bustype: str, bitrate: int, node_id: int = 3, serial_bitrate: int = 115200):
         self.node_id = node_id
-        self.bus = can.interface.Bus(channel=channel, interface=bustype, bitrate=bitrate)
+        try:
+            bus_kwargs = {"channel": channel, "interface": bustype, "bitrate": bitrate}
+            # CANtact/Canable 在 slcan 模式下通常需要设置串口波特率。
+            if bustype == "slcan":
+                bus_kwargs["ttyBaudrate"] = serial_bitrate
+            self.bus = can.interface.Bus(**bus_kwargs)
+        except Exception as exc:
+            hint = _can_setup_hint(bustype)
+            raise RuntimeError(
+                f"CAN 初始化失败: interface={bustype}, channel={channel}, bitrate={bitrate}. {hint}"
+            ) from exc
 
     def send_sdo(self, frame: SDOFrame) -> None:
         msg = can.Message(
@@ -153,21 +196,28 @@ def main() -> None:
     parser.add_argument("--emg-channel", type=int, default=3, help="用于触发的 EMG 通道号(1-16)")
     parser.add_argument("--threshold-uv", type=float, default=30.0, help="阈值，单位 uV")
     parser.add_argument("--cooldown", type=float, default=3.0, help="触发后冷却时间(s)")
-    parser.add_argument("--can-if", default="can0", help="CAN 通道名，如 can0")
-    parser.add_argument("--can-type", default="socketcan", help="python-can interface 类型")
+    parser.add_argument("--can-if", default=None, help="CAN 通道名，如 can0 或 Windows 下 COM3")
+    parser.add_argument("--can-type", default=_default_can_interface(), help="python-can interface 类型")
     parser.add_argument("--bitrate", type=int, default=1000000, help="CAN 波特率")
+    parser.add_argument("--serial-bitrate", type=int, default=115200, help="串口 CAN 的串口波特率（slcan）")
     args = parser.parse_args()
 
     ch_idx = args.emg_channel - 1
     if not (0 <= ch_idx < 16):
         raise ValueError("--emg-channel 必须在 1~16")
 
+    can_channel = args.can_if or _default_can_channel(args.can_type)
+    print(
+        f"CAN config: interface={args.can_type}, channel={can_channel}, "
+        f"bitrate={args.bitrate}, serial_bitrate={args.serial_bitrate}"
+    )
     emg = EmgReader(host=args.host)
     motor = MotorController(
-        channel=args.can_if,
+        channel=can_channel,
         bustype=args.can_type,
         bitrate=args.bitrate,
         node_id=3,
+        serial_bitrate=args.serial_bitrate,
     )
 
     last_trigger = 0.0
